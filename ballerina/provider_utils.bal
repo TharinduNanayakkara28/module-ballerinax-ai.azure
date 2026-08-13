@@ -238,10 +238,12 @@ isolated function handleParseResponseError(error chatResponseError) returns erro
 }
 
 isolated function generateLlmResponse(chat:Client llmClient, string deploymentId,
-        string apiVersion, decimal temperature, int maxTokens, ai:Prompt prompt,
+        string apiVersion, decimal? temperature, int maxTokens, ai:Prompt prompt,
         typedesc<json> expectedResponseTypedesc) returns anydata|ai:Error {
     observe:GenerateContentSpan span = observe:createGenerateContentSpan(deploymentId);
-    span.addTemperature(temperature);
+    if temperature is decimal {
+        span.addTemperature(temperature);
+    }
     span.addProvider("azure.ai.openai");
     
     DocumentContentPart[] content;
@@ -264,10 +266,12 @@ isolated function generateLlmResponse(chat:Client llmClient, string deploymentId
             }
         ],
         tools,
-        temperature,
         max_tokens: maxTokens,
         tool_choice: getGetResultsToolChoice()
     };
+    if temperature is decimal {
+        request.temperature = temperature;
+    }
     span.addInputMessages(request.messages.toJson());
 
     chat:CreateChatCompletionResponse|error response =

@@ -24,7 +24,7 @@ service /llm on new http:Listener(8080) {
             string api\-version, chat:CreateChatCompletionRequest payload)
                 returns chat:CreateChatCompletionResponse|error {
         test:assertEquals(api\-version, "2023-08-01-preview");
-        test:assertEquals(payload?.temperature, DEFAULT_TEMPERATURE);
+        test:assertEquals(payload?.temperature, ());
         test:assertEquals(payload.max_tokens, DEFAULT_MAX_TOKEN_COUNT);
         chat:ChatCompletionRequestMessage[] messages = check payload.messages.ensureType();
         chat:ChatCompletionRequestMessage message = messages[0];

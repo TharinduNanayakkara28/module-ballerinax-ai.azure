@@ -137,6 +137,9 @@ type ChatCompletionChunkDelta record {
     string refusal?;
     # Incremental tool calls being streamed
     ChunkToolCall[] tool_calls?;
+    # Azure-specific extension carrying the reasoning/chain-of-thought fragment
+    # streamed by supported reasoning ("thinking") models, e.g. `o3`, `o4-mini`
+    string reasoning_content?;
 };
 
 # An incremental tool call within a streamed delta
@@ -245,6 +248,10 @@ isolated function toAiChunk(ChatCompletionChunk w) returns ai:ChatCompletionChun
         ai:ROLE? role = mapRole(c.delta?.role);
         if role is ai:ROLE {
             delta.role = role;
+        }
+        string? reasoning = c.delta?.reasoning_content;
+        if reasoning is string {
+            delta.reasoning = reasoning;
         }
         ChunkToolCall[]? wireToolCalls = c.delta?.tool_calls;
         if wireToolCalls is ChunkToolCall[] {
