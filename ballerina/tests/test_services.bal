@@ -54,6 +54,20 @@ service /llm on new http:Listener(8080) {
         return getTestServiceResponse(initialText);
     }
 
+    // Backs `chatStream`/`generateStream` tests. Streams a canned sequence of
+    // `chat.completion.chunk` SSE events for a "thinking" model: a role delta,
+    // reasoning-content fragments, content fragments, a finish-reason chunk, and
+    // a final usage-only chunk, terminated by the `[DONE]` sentinel.
+    resource function post azureopenai/deployments/gpt4streaming/chat/completions(
+            string api\-version, map<json> payload) returns stream<http:SseEvent, error?>|error {
+        test:assertEquals(api\-version, "2023-08-01-preview");
+        test:assertEquals(payload["stream"], true);
+        // Reasoning-model deployments reject a non-default temperature; verify
+        // it is omitted from the streaming request just like the non-streaming one.
+        test:assertEquals(payload["temperature"], ());
+        return getStreamingChunkEvents().toStream();
+    }
+
     resource function post deployments/[string deploymentId]/embeddings(string api\-version, embeddings:Deploymentid_embeddings_body payload)
         returns embeddings:Inline_response_200|error {
         embeddings:Inline_response_200_data[] data = from int i in 0 ..< 2

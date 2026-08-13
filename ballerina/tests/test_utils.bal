@@ -14,6 +14,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import ballerina/http;
 import ballerinax/azure.openai.chat;
 
 isolated function getExpectedParameterSchema(string message) returns map<json> {
@@ -271,6 +272,35 @@ isolated function getTheMockLLMResult(string message) returns string {
     }
 
     return "INVALID";
+}
+
+// Canned `chat.completion.chunk` SSE payload sequence for the streaming tests, modeled on a
+// reasoning ("thinking") model deployment: a role delta, two reasoning-content fragments, two
+// content fragments, a finish-reason chunk, and a final usage-only chunk. The `[DONE]` sentinel
+// terminates the stream, matching Azure's real wire format.
+const STREAMING_REASONING_TEXT = "Let me think about this.";
+const STREAMING_CONTENT_TEXT = "Hello world";
+
+isolated function getStreamingChunkEvents() returns http:SseEvent[] {
+    json[] chunks = [
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {role: "assistant"}}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {reasoning_content: "Let me think"}}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {reasoning_content: " about this."}}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {content: "Hello"}}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {content: " world"}}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [{index: 0, delta: {}, finish_reason: "stop"}]},
+        {id: "chunk-1", 'object: "chat.completion.chunk", created: 1700000000, model: "gpt-4o",
+            choices: [], usage: {prompt_tokens: 5, completion_tokens: 3, total_tokens: 8}}
+    ];
+    http:SseEvent[] events = from json chunkPayload in chunks select {data: chunkPayload.toJsonString()};
+    events.push({data: "[DONE]"});
+    return events;
 }
 
 isolated function getTestServiceResponse(string content) returns chat:CreateChatCompletionResponse =>
