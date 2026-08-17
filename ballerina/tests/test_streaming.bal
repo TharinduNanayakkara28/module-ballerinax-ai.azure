@@ -17,12 +17,28 @@
 import ballerina/ai;
 import ballerina/test;
 
-final OpenAiModelProvider streamingProvider = check new (SERVICE_URL, API_KEY, "gpt4streaming", API_VERSION);
+// Streaming is exercised against both surfaces `chatStream`/`generateStream` support: the legacy
+// (deployment-scoped, `api-version` query parameter) route and the v1 GA (`/v1`, deployment sent as `model`)
+// route. Both mock resources (see `test_services.bal`) serve the same canned `getStreamingChunkEvents()` SSE
+// sequence for any `stream: true` request, so the two providers are expected to observe identical results.
+final OpenAiModelProvider legacyStreamingProvider =
+    check new (SERVICE_URL, API_KEY, "gpt4streaming", API_VERSION);
+final OpenAiModelProvider v1StreamingProvider =
+    check new (SERVICE_URL_V1, API_KEY, "gpt4streaming");
 
 @test:Config
-function testChatStream() returns error? {
+function testChatStreamLegacy() returns error? {
+    check assertChatStream(legacyStreamingProvider);
+}
+
+@test:Config
+function testChatStreamV1() returns error? {
+    check assertChatStream(v1StreamingProvider);
+}
+
+function assertChatStream(OpenAiModelProvider provider) returns error? {
     stream<ai:ChatCompletionChunk, ai:Error?> chunkStream =
-        check streamingProvider->chatStream({role: ai:USER, content: "Say hello."});
+        check provider->chatStream({role: ai:USER, content: "Say hello."});
 
     string content = "";
     string reasoning = "";
@@ -67,8 +83,17 @@ function testChatStream() returns error? {
 }
 
 @test:Config
-function testGenerateStream() returns error? {
-    stream<string, ai:Error?> textStream = check streamingProvider->generateStream(`Say hello.`);
+function testGenerateStreamLegacy() returns error? {
+    check assertGenerateStream(legacyStreamingProvider);
+}
+
+@test:Config
+function testGenerateStreamV1() returns error? {
+    check assertGenerateStream(v1StreamingProvider);
+}
+
+function assertGenerateStream(OpenAiModelProvider provider) returns error? {
+    stream<string, ai:Error?> textStream = check provider->generateStream(`Say hello.`);
 
     string result = "";
     while true {
@@ -89,10 +114,23 @@ function testGenerateStream() returns error? {
 
 @test:Config
 function testGenerateStreamWithUnsupportedType() returns error? {
-    stream<int, ai:Error?>|ai:Error result = streamingProvider->generateStream(`Say hello.`);
+    stream<int, ai:Error?>|ai:Error result = legacyStreamingProvider->generateStream(`Say hello.`);
     test:assertTrue(result is ai:Error, "Expected an error for a non-string expected type");
 
     string message = (<ai:Error>result).message();
     test:assertTrue(message.includes("This data type is not supported for streaming"),
+            string `unexpected error message: ${message}`);
+}
+
+@test:Config
+function testChatStreamUnsupportedForResponsesApi() returns error? {
+    OpenAiModelProvider responsesProvider =
+        check new (SERVICE_URL, API_KEY, "gpt4streaming", API_VERSION, apiType = RESPONSES);
+    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result =
+        responsesProvider->chatStream({role: ai:USER, content: "Say hello."});
+    test:assertTrue(result is ai:Error, "Expected an error when streaming a Responses API provider");
+
+    string message = (<ai:Error>result).message();
+    test:assertTrue(message.includes("apiType = CHAT_COMPLETIONS"),
             string `unexpected error message: ${message}`);
 }

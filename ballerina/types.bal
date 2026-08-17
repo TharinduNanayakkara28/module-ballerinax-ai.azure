@@ -14,7 +14,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+import ballerina/ai;
 import ballerina/http;
+import ballerinax/azure.openai.chat;
 
 # Configurations for controlling the behaviours when communicating with a remote HTTP endpoint.
 @display {label: "Connection Configuration"}
@@ -116,4 +118,164 @@ public enum ReasoningEffort {
     HIGH = "high",
     # The largest amount of reasoning; supported by `gpt-5.1-codex-max` and later.
     XHIGH = "xhigh"
+}
+
+// ===== Streaming (`chatStream`) wire types =====
+//
+// The generated `azure.openai.chat` connector already models the Chat Completions streaming schema
+// (`OpenAIChatCompletionStreamResponseDelta`, `OpenAIChatCompletionMessageToolCallChunk`, ...), including the
+// Azure-specific `reasoning_content` extension. It is not reused directly for parsing here because it declares
+// `content`/`refusal`/`reasoning_content`/`usage` as optional but not nilable, whereas Azure sends each of these
+// as an explicit JSON `null` on chunks that don't carry that field; binding the raw SSE payload straight to the
+// generated type therefore fails `cloneWithType` on those chunks. These module-local mirrors keep the same field
+// set (reusing the connector's tool-call-chunk and usage types, which are not affected) but declare every
+// Azure-nullable field nilable.
+
+# Wire shape of a Chat Completions streaming chunk (`chat.completion.chunk`), as sent by Azure over SSE.
+type ChatCompletionChunk record {
+    # Unique identifier for the completion; stable across all chunks of one response
+    string id?;
+    # The model that produced the completion
+    string model?;
+    # Backend configuration fingerprint associated with this completion
+    string system_fingerprint?;
+    # Choices in this chunk; empty in the final usage-only chunk
+    ChatCompletionChunkChoice[] choices;
+    # Token usage, present only in the final chunk when `stream_options.include_usage` is set. Azure sends this
+    # key with an explicit JSON `null` on every other chunk, so the field must be nilable, not just optional, or
+    # `cloneWithType` rejects every intermediate chunk.
+    chat:OpenAICompletionUsage? usage?;
+};
+
+# A single choice within a streamed chunk.
+type ChatCompletionChunkChoice record {
+    # Index of the choice in the list of choices
+    int index;
+    # The incremental message content for this chunk
+    ChatCompletionChunkDelta delta;
+    # Reason the model stopped generating tokens; `()` until the final chunk
+    string? finish_reason?;
+};
+
+# The incremental delta for a streamed choice. Azure sends `content`/`refusal`/`reasoning_content` as explicit
+# JSON `null` on chunks that don't carry that field (e.g. a tool-call-only delta), so these must be nilable, not
+# just optional, or `cloneWithType` rejects the chunk.
+type ChatCompletionChunkDelta record {
+    # Role of the author, sent only on the first delta (typically "assistant")
+    string role?;
+    # Text content chunk
+    string? content?;
+    # Refusal message chunk, if the model refuses
+    string? refusal?;
+    # Incremental tool calls being streamed
+    chat:OpenAIChatCompletionMessageToolCallChunk[] tool_calls?;
+    # Azure-specific extension carrying the reasoning/chain-of-thought fragment streamed by supported reasoning
+    # ("thinking") models, e.g. `o3`, `o4-mini`
+    string? reasoning_content?;
+};
+
+# Converts one parsed Azure wire chunk into the normalized chunk that `chatStream` returns.
+#
+# + w - The parsed Azure wire chunk
+# + return - The normalized chunk
+isolated function toAiChunk(ChatCompletionChunk w) returns ai:ChatCompletionChunk {
+    ai:ChatCompletionChunkChoice[] choices = [];
+    foreach ChatCompletionChunkChoice c in w.choices {
+        ai:ChatCompletionChunkDelta delta = {};
+        string? content = c.delta?.content;
+        if content is string {
+            delta.content = content;
+        }
+        ai:ROLE? role = mapRole(c.delta?.role);
+        if role is ai:ROLE {
+            delta.role = role;
+        }
+        string? reasoning = c.delta?.reasoning_content;
+        if reasoning is string {
+            delta.reasoning = reasoning;
+        }
+        chat:OpenAIChatCompletionMessageToolCallChunk[]? wireToolCalls = c.delta?.tool_calls;
+        if wireToolCalls is chat:OpenAIChatCompletionMessageToolCallChunk[] {
+            ai:ToolCallChunk[] toolCalls = [];
+            foreach chat:OpenAIChatCompletionMessageToolCallChunk tc in wireToolCalls {
+                ai:ToolCallChunk toolCall = {index: tc.index};
+                string? id = tc?.id;
+                if id is string {
+                    toolCall.id = id;
+                }
+                chat:OpenAIChatCompletionMessageToolCallChunkFunction? fn = tc?.'function;
+                if fn is chat:OpenAIChatCompletionMessageToolCallChunkFunction {
+                    ai:FunctionCallChunk functionCallChunk = {};
+                    string? name = fn?.name;
+                    if name is string {
+                        functionCallChunk.name = name;
+                    }
+                    string? args = fn?.arguments;
+                    if args is string {
+                        functionCallChunk.arguments = args;
+                    }
+                    toolCall.'function = functionCallChunk;
+                }
+                toolCalls.push(toolCall);
+            }
+            delta.toolCalls = toolCalls;
+        }
+        choices.push({index: c.index, delta, finishReason: mapFinishReason(c?.finish_reason)});
+    }
+
+    ai:ChatCompletionChunk chunk = {id: w.id, model: w.model, choices};
+    chat:OpenAICompletionUsage? usage = w?.usage;
+    if usage is chat:OpenAICompletionUsage {
+        chunk.usage = {
+            promptTokens: usage.prompt_tokens,
+            completionTokens: usage.completion_tokens,
+            totalTokens: usage.total_tokens
+        };
+    }
+    return chunk;
+}
+
+# Safe string→enum lookup for the streamed delta role (no raw cast that could panic).
+#
+# + role - The wire role string, if present
+# + return - The normalized role, or `()` for an absent/unrecognized value
+isolated function mapRole(string? role) returns ai:ROLE? {
+    match role {
+        "system" => {
+            return ai:SYSTEM;
+        }
+        "user" => {
+            return ai:USER;
+        }
+        "assistant" => {
+            return ai:ASSISTANT;
+        }
+        _ => {
+            return ();
+        }
+    }
+}
+
+# Safe string→enum lookup for the streamed finish reason.
+#
+# + finishReason - The wire finish-reason string, if present
+# + return - The normalized finish reason, or `()` for an absent/unrecognized value
+isolated function mapFinishReason(string? finishReason) returns ai:FinishReason? {
+    match finishReason {
+        "stop" => {
+            return ai:STOP;
+        }
+        "length" => {
+            return ai:LENGTH;
+        }
+        "tool_calls"|"function_call" => {
+            return ai:TOOL_CALLS;
+        }
+        "content_filter" => {
+            return ai:CONTENT_FILTER;
+        }
+        _ => {
+            return ();
+        }
+    }
 }

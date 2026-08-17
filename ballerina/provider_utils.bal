@@ -386,6 +386,82 @@ isolated function postChatCompletion(chat:Client? chatClient, http:Client? legac
     return result;
 }
 
+# Serializes a Chat Completions request for the v1 GA route.
+#
+# Unlike the legacy route, the v1 GA surface carries the deployment as `model` in the body (there is no
+# deployment path segment in the URL), so `model` is kept.
+#
+# + request - The Chat Completions request (with the token-limit field already selected)
+# + return - The wire body, or an `ai:Error` on serialization failure
+isolated function buildV1ChatBody(chat:ChatCompletionsBody request) returns map<json>|ai:Error {
+    do {
+        return check jsondata:toJson(request).ensureType();
+    } on fail error e {
+        return error ai:Error("Failed to build the Chat Completions request body", e);
+    }
+}
+
+# Opens a streaming (`stream: true`) Chat Completions request against the configured surface and returns the raw
+# Server-Sent Event stream.
+#
+# The generated `chat:Client` (used for the non-streaming v1 GA path) binds its response to a single value and
+# cannot consume Server-Sent Events, so both surfaces stream through a raw HTTP client:
+#
+# - **v1 GA** (`useV1` is `true`): `v1StreamClient` posts `{serviceUrl}/chat/completions` (`model` kept in the
+#   body). `api-version` is only sent when the caller opted into `preview`/`v1` (`v1ApiVersion`).
+# - **Legacy** (otherwise): `legacyChatClient` (already a raw client) posts
+#   `{legacyBase}/deployments/{deploymentId}/chat/completions?api-version={apiVersion}`, `model` dropped from the
+#   body.
+#
+# Both routes send the `api-key` header and set `stream: true` / `stream_options.include_usage: true` on the
+# request before serializing it.
+#
+# + v1StreamClient - The raw HTTP client for the v1 GA surface (`()` on the legacy path)
+# + legacyChatClient - The raw HTTP client for the legacy route (`()` on the v1 path)
+# + useV1 - `true` to target the v1 GA surface; `false` for the legacy route
+# + apiKey - The Azure OpenAI API key (sent as the `api-key` header on both routes)
+# + deploymentId - The Azure deployment ID
+# + apiVersion - The date-based `api-version` used on the legacy route
+# + v1ApiVersion - The `preview`/`v1` api-version to forward on the v1 route, if any
+# + request - The prepared Chat Completions request
+# + return - The opened Server-Sent Event stream, or an `ai:Error` on failure
+isolated function postChatCompletionStream(http:Client? v1StreamClient, http:Client? legacyChatClient,
+        boolean useV1, string apiKey, string deploymentId, string? apiVersion, string? v1ApiVersion,
+        chat:ChatCompletionsBody request) returns stream<http:SseEvent, error?>|ai:Error {
+    request.'stream = true;
+    request.stream_options = {include_usage: true};
+
+    http:Response|error response;
+    if useV1 {
+        http:Client? streamClient = v1StreamClient;
+        if streamClient is () {
+            return error ai:Error("Chat Completions (v1) streaming client is not initialized");
+        }
+        map<json> body = check buildV1ChatBody(request);
+        string path = "/chat/completions";
+        if v1ApiVersion is string {
+            path += "?api-version=" + v1ApiVersion;
+        }
+        response = streamClient->post(path, body, {"api-key": apiKey});
+    } else {
+        http:Client? streamClient = legacyChatClient;
+        if streamClient is () {
+            return error ai:Error("Chat Completions (legacy) streaming client is not initialized");
+        }
+        map<json> body = check buildLegacyChatBody(request);
+        string path = string `/deployments/${deploymentId}/chat/completions?api-version=${apiVersion ?: ""}`;
+        response = streamClient->post(path, body, {"api-key": apiKey});
+    }
+    if response is error {
+        return error ai:LlmConnectionError("Error while connecting to the model for streaming", response);
+    }
+    stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+    if sseStream is error {
+        return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+    }
+    return sseStream;
+}
+
 # Generates a structured value from the LLM via the Chat Completions API (the `generate` method's chat path).
 #
 # + chatClient - The generated Chat Completions connector for the v1 GA surface (`()` on the legacy path)
