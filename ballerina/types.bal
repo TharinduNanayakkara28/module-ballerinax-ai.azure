@@ -108,8 +108,10 @@ type ChatCompletionChunk record {
     string system_fingerprint?;
     # Choices in this chunk; empty in the final usage-only chunk
     ChatCompletionChunkChoice[] choices;
-    # Token usage, present only in the final chunk when stream_options.include_usage is set
-    ChatCompletionUsage usage?;
+    # Token usage, present only in the final chunk when stream_options.include_usage is set.
+    # Azure sends this key with an explicit JSON `null` on every other chunk, so the field
+    # must be nilable (not just optional) or `cloneWithType` rejects every intermediate chunk.
+    ChatCompletionUsage? usage?;
     # Content-filter results for each input prompt, sent by Azure on the first chunk(s)
     PromptFilterResult[] prompt_filter_results?;
 };
@@ -127,19 +129,22 @@ type ChatCompletionChunkChoice record {
     ContentFilterResults content_filter_results?;
 };
 
-# The incremental delta for a streamed choice
+# The incremental delta for a streamed choice.
+# Azure sends `content`/`refusal`/`reasoning_content` as explicit JSON `null` on chunks that
+# don't carry that field (e.g. a tool-call-only delta), so these must be nilable, not just
+# optional, or `cloneWithType` rejects the chunk.
 type ChatCompletionChunkDelta record {
     # Role of the author, sent only on the first delta (typically "assistant")
     string role?;
     # Text content chunk
-    string content?;
+    string? content?;
     # Refusal message chunk, if the model refuses
-    string refusal?;
+    string? refusal?;
     # Incremental tool calls being streamed
     ChunkToolCall[] tool_calls?;
     # Azure-specific extension carrying the reasoning/chain-of-thought fragment
     # streamed by supported reasoning ("thinking") models, e.g. `o3`, `o4-mini`
-    string reasoning_content?;
+    string? reasoning_content?;
 };
 
 # An incremental tool call within a streamed delta
@@ -283,7 +288,7 @@ isolated function toAiChunk(ChatCompletionChunk w) returns ai:ChatCompletionChun
     }
 
     ai:ChatCompletionChunk chunk = {id: w.id, model: w.model, choices};
-    ChatCompletionUsage? usage = w.usage;
+    ChatCompletionUsage? usage = w?.usage;
     if usage is ChatCompletionUsage {
         chunk.usage = {
             promptTokens: usage.prompt_tokens,

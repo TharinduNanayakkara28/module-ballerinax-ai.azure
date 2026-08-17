@@ -231,7 +231,7 @@ public isolated client class OpenAiModelProvider {
             request["tools"] = chatTools;
         }
 
-        string path = string `/deployments/${self.deploymentId}/chat/completions?api-version=${self.apiVersion}`;
+        string path = string `/openai/deployments/${self.deploymentId}/chat/completions?api-version=${self.apiVersion}`;
         http:Response|error response = self.streamClient->post(path, request, {"api-key": self.apiKey});
         if response is error {
             return error ai:LlmConnectionError("Error while connecting to the model for streaming", response);
