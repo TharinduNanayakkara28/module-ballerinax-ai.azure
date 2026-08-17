@@ -14,7 +14,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import ballerina/ai;
 import ballerina/http;
 
 # Configurations for controlling the behaviours when communicating with a remote HTTP endpoint.
@@ -78,271 +77,43 @@ public type ConnectionConfig record {|
     boolean validation = true;
 |};
 
-type AzureChatUserMessage record {|
-    *ai:ChatUserMessage;
-    string content;
-|};
-
-type AzureChatSystemMessage record {|
-    *ai:ChatSystemMessage;
-    string content;
-|};
-
-// ── Streaming types (Chat Completions `chat.completion.chunk`) ───────────────
-// Azure OpenAI streams the Chat Completions API as server-sent events, one
-// `chat.completion.chunk` object per event. The shape matches OpenAI's Chat
-// Completions chunk, plus Azure's content-filter additions
-// (`prompt_filter_results` and per-choice `content_filter_results`).
-
-# A streamed chunk of a chat completion response (object: "chat.completion.chunk")
-type ChatCompletionChunk record {
-    # Unique identifier for the completion, shared across all chunks
-    string id;
-    # Object type, always "chat.completion.chunk"
-    string 'object;
-    # Unix timestamp (seconds) when the completion was created
-    int created;
-    # The model (deployment) used to generate the completion
-    string model;
-    # Fingerprint of the backend configuration the model runs with
-    string system_fingerprint?;
-    # Choices in this chunk; empty in the final usage-only chunk
-    ChatCompletionChunkChoice[] choices;
-    # Token usage, present only in the final chunk when stream_options.include_usage is set.
-    # Azure sends this key with an explicit JSON `null` on every other chunk, so the field
-    # must be nilable (not just optional) or `cloneWithType` rejects every intermediate chunk.
-    ChatCompletionUsage? usage?;
-    # Content-filter results for each input prompt, sent by Azure on the first chunk(s)
-    PromptFilterResult[] prompt_filter_results?;
-};
-
-# A single choice within a streamed chunk
-type ChatCompletionChunkChoice record {
-    # Index of the choice in the list of choices
-    int index;
-    # The incremental content for this choice
-    ChatCompletionChunkDelta delta;
-    # Reason the model stopped, null until the final chunk for this choice
-    # (e.g., "stop", "length", "tool_calls", "content_filter")
-    string? finish_reason = ();
-    # Content-filter results for the generated output (Azure only)
-    ContentFilterResults content_filter_results?;
-};
-
-# The incremental delta for a streamed choice.
-# Azure sends `content`/`refusal`/`reasoning_content` as explicit JSON `null` on chunks that
-# don't carry that field (e.g. a tool-call-only delta), so these must be nilable, not just
-# optional, or `cloneWithType` rejects the chunk.
-type ChatCompletionChunkDelta record {
-    # Role of the author, sent only on the first delta (typically "assistant")
-    string role?;
-    # Text content chunk
-    string? content?;
-    # Refusal message chunk, if the model refuses
-    string? refusal?;
-    # Incremental tool calls being streamed
-    ChunkToolCall[] tool_calls?;
-    # Azure-specific extension carrying the reasoning/chain-of-thought fragment
-    # streamed by supported reasoning ("thinking") models, e.g. `o3`, `o4-mini`
-    string? reasoning_content?;
-};
-
-# An incremental tool call within a streamed delta
-type ChunkToolCall record {
-    # Index of the tool call, used to accumulate fragments across chunks
-    int index;
-    # Unique identifier for the tool call, sent on the first fragment
-    string id?;
-    # Tool type, sent on the first fragment (always "function")
-    string 'type?;
-    # The function name/arguments fragment
-    ChunkToolCallFunction 'function?;
-};
-
-# Function name/arguments fragment in a streamed tool call
-type ChunkToolCallFunction record {
-    # Name of the function, sent on the first fragment
-    string name?;
-    # Partial JSON string chunk of the function arguments; accumulate across chunks
-    string arguments?;
-};
-
-# Token usage for a streamed completion (final chunk when include_usage is set)
-type ChatCompletionUsage record {
-    # Number of tokens in the prompt
-    int prompt_tokens;
-    # Number of tokens in the generated completion
-    int completion_tokens;
-    # Total number of tokens used (prompt + completion)
-    int total_tokens;
-};
-
-// ── Azure-specific: content-filter types ────────────────────────────────────
-
-# Result of a content-filter category that reports a severity level
-type ContentFilterSeverityResult record {
-    # Whether the content was filtered for this category
-    boolean filtered;
-    # Severity level ("safe", "low", "medium", "high")
-    string severity;
-};
-
-# Result of a content-filter category that reports a boolean detection
-type ContentFilterDetectedResult record {
-    # Whether the content was filtered for this category
-    boolean filtered;
-    # Whether the pattern was detected
-    boolean detected;
-};
-
-# Set of content-filter results for a piece of content.
-# Categories are present only when the filter ran for them.
-type ContentFilterResults record {
-    # Hateful content category result
-    ContentFilterSeverityResult hate?;
-    # Self-harm content category result
-    ContentFilterSeverityResult self_harm?;
-    # Sexual content category result
-    ContentFilterSeverityResult sexual?;
-    # Violent content category result
-    ContentFilterSeverityResult violence?;
-    # Jailbreak detection result
-    ContentFilterDetectedResult jailbreak?;
-    # Protected-material (text) detection result
-    ContentFilterDetectedResult protected_material_text?;
-    # Protected-material (code) detection result
-    ContentFilterDetectedResult protected_material_code?;
-    # Profanity detection result
-    ContentFilterDetectedResult profanity?;
-    # Error encountered while running the filter, if any
-    ContentFilterError 'error?;
-};
-
-# Error reported when a content filter could not be evaluated
-type ContentFilterError record {
-    # Error code
-    int code;
-    # Error message
-    string message;
-};
-
-# Content-filter results for one input prompt (top-level prompt_filter_results)
-type PromptFilterResult record {
-    # Index of the prompt these results apply to
-    int prompt_index;
-    # Content-filter results for the prompt
-    ContentFilterResults content_filter_results;
-};
-
-// ── Wire → normalized mapping ──────────────────────────────────────────────
-// Projects an Azure OpenAI `chat.completion.chunk` (the wire types above) onto
-// the normalized `ai:ChatCompletionChunk` that `chatStream` must return. Only the
-// subset the `ai` type can hold is mapped; Azure content-filter results and other
-// fields are ignored.
-
-# Maps an Azure OpenAI wire chunk onto the normalized `ai:ChatCompletionChunk`.
-# Forwards tool calls on every chunk (not just the first), so argument fragments
-# stream through correctly.
+# The Azure OpenAI API surface used by the `OpenAiModelProvider`.
 #
-# + w - The parsed Azure OpenAI wire chunk
-# + return - The normalized chunk consumed by the `ai` module
-isolated function toAiChunk(ChatCompletionChunk w) returns ai:ChatCompletionChunk {
-    ai:ChatCompletionChunkChoice[] choices = [];
-    foreach ChatCompletionChunkChoice c in w.choices {
-        ai:ChatCompletionChunkDelta delta = {content: c.delta?.content};
-        ai:ROLE? role = mapRole(c.delta?.role);
-        if role is ai:ROLE {
-            delta.role = role;
-        }
-        string? reasoning = c.delta?.reasoning_content;
-        if reasoning is string {
-            delta.reasoning = reasoning;
-        }
-        ChunkToolCall[]? wireToolCalls = c.delta?.tool_calls;
-        if wireToolCalls is ChunkToolCall[] {
-            ai:ToolCallChunk[] toolCalls = [];
-            foreach ChunkToolCall t in wireToolCalls {
-                ai:ToolCallChunk toolCall = {index: t.index};
-                string? id = t?.id;
-                if id is string {
-                    toolCall.id = id;
-                }
-                ChunkToolCallFunction? fn = t?.'function;
-                if fn is ChunkToolCallFunction {
-                    ai:FunctionCallChunk functionFragment = {};
-                    string? name = fn?.name;
-                    if name is string {
-                        functionFragment.name = name;
-                    }
-                    string? arguments = fn?.arguments;
-                    if arguments is string {
-                        functionFragment.arguments = arguments;
-                    }
-                    toolCall.'function = functionFragment;
-                }
-                toolCalls.push(toolCall);
-            }
-            delta.toolCalls = toolCalls;
-        }
-        choices.push({index: c.index, delta, finishReason: mapFinishReason(c.finish_reason)});
-    }
-
-    ai:ChatCompletionChunk chunk = {id: w.id, model: w.model, choices};
-    ChatCompletionUsage? usage = w?.usage;
-    if usage is ChatCompletionUsage {
-        chunk.usage = {
-            promptTokens: usage.prompt_tokens,
-            completionTokens: usage.completion_tokens,
-            totalTokens: usage.total_tokens
-        };
-    }
-    return chunk;
+# The concrete wire route is derived from both this value and the shape of the `serviceUrl`:
+#
+# | `apiType` | `serviceUrl` ends with `/v1` (v1 GA) | otherwise (legacy) |
+# | --- | --- | --- |
+# | `CHAT_COMPLETIONS` | `POST {serviceUrl}/chat/completions` via the `azure.openai.chat` connector | `POST {legacyBase}/deployments/{deploymentId}/chat/completions?api-version={apiVersion}` |
+# | `RESPONSES` | `POST {serviceUrl}/responses` via the `azure.openai.responses` connector | `POST {legacyBase}/responses?api-version={apiVersion}` |
+#
+# On the legacy surface `legacyBase` is the `serviceUrl` completed with `/openai` when it is a bare origin
+# (e.g. `https://<resource>.openai.azure.com`) and used verbatim when it already carries a path (e.g. an API
+# Management base path).
+@display {label: "OpenAI API Type"}
+public enum ApiType {
+    # Use the OpenAI Chat Completions API (`/chat/completions`)
+    CHAT_COMPLETIONS = "chat_completions",
+    # Use the OpenAI Responses API (`/responses`)
+    RESPONSES = "responses"
 }
 
-# Safely maps an Azure OpenAI role string onto the `ai:ROLE` enum; returns `()` for
-# absent or unrecognized values rather than panicking on a cast.
+# Reasoning effort level for reasoning models (`gpt-5`/`o`-series).
 #
-# + role - The role string from the wire delta
-# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
-isolated function mapRole(string? role) returns ai:ROLE? {
-    // Streamed response deltas only carry the "assistant" role; "system"/"user"
-    // are handled for completeness. ("function" is request-only and the `ai`
-    // enum member is not accessible here, so it is intentionally omitted.)
-    match role {
-        "system" => {
-            return ai:SYSTEM;
-        }
-        "user" => {
-            return ai:USER;
-        }
-        "assistant" => {
-            return ai:ASSISTANT;
-        }
-    }
-    return ();
+# The supported set follows the Azure OpenAI specification. Not every model supports every value (for example,
+# `MINIMAL` is only supported by the original `gpt-5` reasoning models, `XHIGH` only by `gpt-5.1-codex-max` and
+# later, and `NONE` only by `gpt-5.1`+). Passing an unsupported value for the target deployment results in an
+# error from the service.
+public enum ReasoningEffort {
+    # No reasoning; supported by `gpt-5.1` and later.
+    NONE = "none",
+    # The smallest amount of reasoning; supported by the original `gpt-5` reasoning models.
+    MINIMAL = "minimal",
+    # Favours speed and fewer reasoning tokens.
+    LOW = "low",
+    # Balances reasoning depth and latency.
+    MEDIUM = "medium",
+    # Favours more complete reasoning.
+    HIGH = "high",
+    # The largest amount of reasoning; supported by `gpt-5.1-codex-max` and later.
+    XHIGH = "xhigh"
 }
-
-# Safely maps an Azure OpenAI finish reason onto the `ai:FinishReason` enum. The `ai`
-# enum has no `function_call` member, so the deprecated `function_call` value is
-# folded into `tool_calls`. Returns `()` for absent or unrecognized values.
-#
-# + finishReason - The finish reason from the wire chunk
-# + return - The mapped `ai:FinishReason`, or `()` when absent/unrecognized
-isolated function mapFinishReason(string? finishReason) returns ai:FinishReason? {
-    match finishReason {
-        "stop" => {
-            return ai:STOP;
-        }
-        "length" => {
-            return ai:LENGTH;
-        }
-        "tool_calls"|"function_call" => {
-            return ai:TOOL_CALLS;
-        }
-        "content_filter" => {
-            return ai:CONTENT_FILTER;
-        }
-    }
-    return ();
-}
-
