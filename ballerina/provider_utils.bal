@@ -455,11 +455,59 @@ isolated function postChatCompletionStream(http:Client? v1StreamClient, http:Cli
     if response is error {
         return error ai:LlmConnectionError("Error while connecting to the model for streaming", response);
     }
+    // A non-2xx status still binds to `http:Response` rather than erroring (the target type here is the raw
+    // response, not a typed payload), so it must be checked explicitly before treating the body as an SSE
+    // stream; otherwise `getSseEventStream()` fails on Azure's JSON error body with an opaque parse error that
+    // hides what Azure actually rejected.
+    if response.statusCode != http:STATUS_OK {
+        return error ai:Error(buildStreamingRejectionMessage(deploymentId, response));
+    }
     stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
     if sseStream is error {
         return error ai:Error("Failed to open the SSE stream from the model", sseStream);
     }
     return sseStream;
+}
+
+# Builds a clear error message for a streaming Chat Completions request that Azure rejected (non-2xx response).
+#
+# Surfaces Azure's own error message rather than guessing the cause up front, and adds a hint pointing at the
+# Responses API only when the deployment id itself suggests a GPT-5-series model, since GPT-5-series reasoning
+# deployments are the known case where Chat Completions streaming can be rejected while the Responses API
+# surface still streams the same deployment successfully.
+#
+# + deploymentId - The Azure deployment id that was streamed against
+# + response - The non-2xx HTTP response returned by the streaming request
+# + return - The composed error message
+isolated function buildStreamingRejectionMessage(string deploymentId, http:Response response) returns string {
+    string azureMessage = extractAzureErrorMessage(response);
+    string message = string `Azure OpenAI rejected the streaming request for deployment '${deploymentId}' ` +
+        string `(HTTP ${response.statusCode}): ${azureMessage}`;
+    if deploymentId.toLowerAscii().includes("gpt-5") {
+        message += ". GPT-5-series models may not support streaming via the Chat Completions API — set " +
+            "apiType = RESPONSES to stream from this deployment instead.";
+    }
+    return message;
+}
+
+# Extracts a human-readable error message from a non-2xx Azure OpenAI response: the standard
+# `{"error": {"message": ...}}` shape first, then the raw text body, then the bare status code.
+#
+# + response - The non-2xx HTTP response to extract the message from
+# + return - The best-effort error message
+isolated function extractAzureErrorMessage(http:Response response) returns string {
+    json|error payload = response.getJsonPayload();
+    if payload is json {
+        json|error message = payload.'error.message;
+        if message is string {
+            return message;
+        }
+    }
+    string|error text = response.getTextPayload();
+    if text is string && text.trim().length() > 0 {
+        return text.trim();
+    }
+    return string `HTTP ${response.statusCode}`;
 }
 
 # Generates a structured value from the LLM via the Chat Completions API (the `generate` method's chat path).

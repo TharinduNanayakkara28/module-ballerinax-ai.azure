@@ -56,6 +56,12 @@ public isolated client class OpenAiModelProvider {
     # same base. Created only when `apiType` is `CHAT_COMPLETIONS` and the `serviceUrl` targets the v1 GA surface;
     # `()` otherwise.
     private final http:Client? v1StreamClient;
+    # Raw HTTP client for v1 GA Responses streaming (`POST {serviceUrl}/responses`). The generated
+    # `responses:Client` binds its response to a single value and cannot consume Server-Sent Events, so Responses
+    # streaming always uses a raw client; on the legacy surface it reuses `legacyResponsesClient` instead of
+    # opening a second client to the same base. Created only when `apiType` is `RESPONSES` and the `serviceUrl`
+    # targets the v1 GA surface; `()` otherwise.
+    private final http:Client? v1ResponsesStreamClient;
     # `true` when the `serviceUrl` targets the v1 GA surface (ends with `/v1`); `false` for the legacy surface.
     private final boolean useV1;
     private final string apiKey;
@@ -142,6 +148,18 @@ public isolated client class OpenAiModelProvider {
         } else {
             self.v1StreamClient = ();
         }
+
+        // Same reasoning as `v1StreamClient` above, for the Responses API surface.
+        if apiType == RESPONSES && isV1 {
+            http:Client|error v1ResponsesStreamClient = new (trimmedUrl, toRawHttpConfig(connectionConfig));
+            if v1ResponsesStreamClient is error {
+                return error ai:Error("Failed to initialize the Azure OpenAI Responses streaming client",
+                        v1ResponsesStreamClient);
+            }
+            self.v1ResponsesStreamClient = v1ResponsesStreamClient;
+        } else {
+            self.v1ResponsesStreamClient = ();
+        }
     }
 
     # Sends a chat request to the OpenAI model with the given messages and tools.
@@ -172,10 +190,8 @@ public isolated client class OpenAiModelProvider {
 
     # Sends a streaming chat request to the Azure OpenAI model with the given messages and tools.
     #
-    # Streaming currently supports only the Chat Completions API (`apiType = CHAT_COMPLETIONS`, the default, on
-    # either the legacy or the v1 GA surface); calling this on a provider configured with `apiType = RESPONSES`
-    # returns an `ai:Error`, since the Responses API uses a different event-based streaming protocol that is not
-    # yet implemented.
+    # Supports both API surfaces: `apiType = CHAT_COMPLETIONS` (the default) and `apiType = RESPONSES`, on either
+    # the legacy or the v1 GA surface.
     #
     # + messages - List of chat messages or a single user message
     # + tools - Tool definitions to be used for the tool call
@@ -184,10 +200,14 @@ public isolated client class OpenAiModelProvider {
     remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
             returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
-        if self.apiType != CHAT_COMPLETIONS {
-            return error ai:Error("'chatStream' currently supports only 'apiType = CHAT_COMPLETIONS'; " +
-                "the Responses API does not yet support streaming.");
+        if self.apiType == CHAT_COMPLETIONS {
+            return self.chatStreamViaChatCompletions(messages, tools, stop);
         }
+        return self.chatStreamViaResponses(messages, tools, stop);
+    }
+
+    private isolated function chatStreamViaChatCompletions(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
         chat:OpenAIChatCompletionRequestMessage[]|ai:Error completionMessages =
             self.prepareCompletionRequestMessages(messages);
         if completionMessages is ai:Error {
@@ -223,6 +243,48 @@ public isolated client class OpenAiModelProvider {
             return sseStream;
         }
         stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AzureOpenAiChunkIterator(sseStream));
+        return chunkStream;
+    }
+
+    private isolated function chatStreamViaResponses(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        [responses:OpenAIInputItem[], string?]|ai:Error responseInput = convertToResponsesInput(messages);
+        if responseInput is ai:Error {
+            return error ai:Error("Error while transforming input for Responses API", responseInput);
+        }
+        [responses:OpenAIInputItem[], string?] [inputItems, instructions] = responseInput;
+
+        responses:OpenAICreateResponse request = {
+            model: self.deploymentId,
+            input: inputItems,
+            max_output_tokens: self.maxTokens,
+            store: false
+        };
+        decimal? temperature = self.temperature;
+        if temperature is decimal {
+            request.temperature = temperature;
+        }
+        if instructions is string {
+            request.instructions = instructions;
+        }
+        if stop is string {
+            log:printWarn("The 'stop' parameter is not supported by the Responses API and will be ignored.",
+                model = self.deploymentId);
+        }
+        if tools.length() > 0 {
+            request.tools = convertToResponsesTools(tools);
+        }
+        ReasoningEffort? reasoningEffort = self.reasoning;
+        if reasoningEffort is ReasoningEffort {
+            request.reasoning = {effort: reasoningEffort};
+        }
+
+        stream<http:SseEvent, error?>|ai:Error sseStream = postResponsesStream(self.v1ResponsesStreamClient,
+                self.legacyResponsesClient, self.useV1, self.apiKey, self.apiVersion, self.v1ApiVersion, request);
+        if sseStream is ai:Error {
+            return sseStream;
+        }
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new ResponsesChunkIterator(sseStream));
         return chunkStream;
     }
 

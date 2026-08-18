@@ -370,6 +370,395 @@ isolated function toResponsesConnectionConfig(string apiKey, ConnectionConfig cc
     validation: cc.validation
 };
 
+# Opens a streaming (`stream: true`) Responses request against the configured surface and returns the raw
+# Server-Sent Event stream.
+#
+# The generated `responses:Client` (used for the non-streaming path) binds its response to a single value and
+# cannot consume Server-Sent Events, so both surfaces stream through a raw HTTP client:
+#
+# - **v1 GA** (`useV1` is `true`): `v1ResponsesStreamClient` posts `{serviceUrl}/responses`. `api-version` is only
+#   sent when the caller opted into `preview`/`v1` (`v1ApiVersion`).
+# - **Legacy** (otherwise): `legacyResponsesClient` (already a raw client) posts
+#   `{legacyBase}/responses?api-version={apiVersion}`.
+#
+# Both routes send the `api-key` header and set `stream: true` on the request before serializing it.
+#
+# + v1ResponsesStreamClient - The raw HTTP client for the v1 GA surface (`()` on the legacy path)
+# + legacyResponsesClient - The raw HTTP client for the legacy route (`()` on the v1 path)
+# + useV1 - `true` to target the v1 GA surface; `false` for the legacy route
+# + apiKey - The Azure OpenAI API key (sent as the `api-key` header on both routes)
+# + apiVersion - The date-based `api-version` used on the legacy route
+# + v1ApiVersion - The `preview`/`v1` api-version to forward on the v1 route, if any
+# + request - The prepared Responses request
+# + return - The opened Server-Sent Event stream, or an `ai:Error` on failure
+isolated function postResponsesStream(http:Client? v1ResponsesStreamClient, http:Client? legacyResponsesClient,
+        boolean useV1, string apiKey, string? apiVersion, string? v1ApiVersion,
+        responses:OpenAICreateResponse request) returns stream<http:SseEvent, error?>|ai:Error {
+    request.'stream = true;
+
+    http:Response|error response;
+    if useV1 {
+        http:Client? streamClient = v1ResponsesStreamClient;
+        if streamClient is () {
+            return error ai:Error("Responses (v1) streaming client is not initialized");
+        }
+        string path = "/responses";
+        if v1ApiVersion is string {
+            path += "?api-version=" + v1ApiVersion;
+        }
+        response = streamClient->post(path, request.toJson(), {"api-key": apiKey});
+    } else {
+        http:Client? streamClient = legacyResponsesClient;
+        if streamClient is () {
+            return error ai:Error("Responses (legacy) streaming client is not initialized");
+        }
+        response = streamClient->post(string `/responses?api-version=${apiVersion ?: ""}`, request.toJson(),
+                {"api-key": apiKey});
+    }
+    if response is error {
+        return error ai:LlmConnectionError("Error while connecting to the model for streaming", response);
+    }
+    // A non-2xx response body is JSON, not an SSE stream (`streamClient->post` does not raise `error` for these
+    // status codes, unlike the generated connectors used elsewhere in this module); surface the actual error
+    // body instead of letting `getSseEventStream` fail with an opaque content-type mismatch.
+    if response.statusCode >= 400 {
+        json|error errorBody = response.getJsonPayload();
+        return error ai:LlmConnectionError(string `Error response received from Responses API (status ${
+            response.statusCode}): ${errorBody is json ? errorBody.toJsonString() : response.statusCode.toString()}`);
+    }
+    stream<http:SseEvent, error?>|error sseStream = response.getSseEventStream();
+    if sseStream is error {
+        return error ai:Error("Failed to open the SSE stream from the model", sseStream);
+    }
+    return sseStream;
+}
+
+// ===== Streaming (`chatStream` via `apiType = RESPONSES`) wire types =====
+//
+// The Responses API streams a heterogeneous sequence of typed SSE events (`response.output_text.delta`,
+// `response.function_call_arguments.delta`, `response.completed`, ...) instead of repeated deltas of one
+// envelope shape like Chat Completions. Only the `type` discriminator and the per-event fields this module
+// actually consumes are modeled below; every shape is an open record (no `{| |}`) so unrelated fields already
+// present in the payload - and any Azure adds later - are ignored rather than rejected by `cloneWithType`.
+
+# The `type` discriminator alone, read first to route a raw event to its specific shape below.
+type ResponsesStreamEventType record {
+    # The event kind, e.g. `response.output_text.delta`, `response.completed`
+    string 'type;
+};
+
+# `response.output_item.added` - announces a new output item (a message, function call, or reasoning block) and
+# its position; the `item.id` on a `function_call` item is the key later delta events reference via `item_id`.
+type ResponsesStreamOutputItemAdded record {
+    # The output item that was just added
+    ResponsesStreamItem item;
+};
+
+# The `item` payload of an output-item-added event; only the fields needed to open a tool-call slot are modeled.
+type ResponsesStreamItem record {
+    # The item kind, e.g. `message`, `function_call`, `reasoning`
+    string 'type;
+    # Server-assigned id of this item; the key later delta events reference via `item_id`
+    string id?;
+    # Correlation id for a `function_call` item, echoed back on the matching tool result
+    string call_id?;
+    # Tool name, present on a `function_call` item
+    string name?;
+};
+
+# `response.output_text.delta` - an incremental fragment of the assistant's visible answer text.
+type ResponsesStreamTextDelta record {
+    # The text fragment
+    string delta;
+};
+
+# `response.reasoning_summary_text.delta` / `response.reasoning_text.delta` - an incremental fragment of the
+# model's reasoning ("thinking") content, when the deployment streams a reasoning summary.
+type ResponsesStreamReasoningDelta record {
+    # The reasoning text fragment
+    string delta;
+};
+
+# `response.function_call_arguments.delta` - an incremental fragment of a streamed tool call's JSON arguments,
+# keyed by `item_id` to the slot opened by the corresponding `response.output_item.added` event.
+type ResponsesStreamFunctionCallArgumentsDelta record {
+    # Id of the `function_call` item this fragment belongs to
+    string item_id;
+    # The arguments JSON-string fragment
+    string delta;
+};
+
+# The `response` envelope embedded in a `response.completed` / `.failed` / `.incomplete` terminal streaming
+# event. Deliberately looser than `InlineResponse200` (the non-streaming response type): only the fields this
+# module reads are modeled, all as optional, and `error`/`incomplete_details` are additionally nilable since
+# Azure sends both with an explicit JSON `null` on the terminal streaming envelope too (mirroring
+# `InlineResponse200`'s own required-but-nilable fields) - declaring them as plain (non-nilable) optional fields
+# makes `cloneWithType` reject that explicit `null` and fail even on a well-formed `response.completed` event.
+type ResponsesStreamTerminalResponse record {
+    # Unique identifier for this response
+    string id?;
+    # The status of the response generation
+    "completed"|"failed"|"in_progress"|"cancelled"|"queued"|"incomplete" status?;
+    # The content items generated by the model; present on a successful/failed/incomplete terminal event
+    responses:OpenAIOutputItem[] output?;
+    # Token usage; present once the response is complete
+    responses:OpenAIResponseUsage usage?;
+    # The error detail; present (possibly `null`) when `status` is `failed`
+    responses:OpenAIResponseError? 'error?;
+    # Why generation stopped early; present (possibly `null`) when `status` is `incomplete`
+    responses:OpenAIResponseIncompleteDetails? incomplete_details?;
+};
+
+# `response.completed` / `response.failed` / `response.incomplete` - the terminal event carrying the response
+# envelope (status, usage, output, and, on failure, the error).
+type ResponsesStreamTerminalEvent record {
+    # The response envelope
+    ResponsesStreamTerminalResponse response;
+};
+
+# A top-level stream `error` event (distinct from a `response.failed` terminal event, e.g. a mid-stream rate
+# limit or connection problem).
+type ResponsesStreamErrorEvent record {
+    # Human-readable error description
+    string message;
+};
+
+# Maps a completed Responses envelope's `output` array to the Chat-Completions-style finish reason: `TOOL_CALLS`
+# when the model's turn ended in a function call, `STOP` otherwise. The Responses API has no direct equivalent of
+# Chat Completions' `finish_reason: "tool_calls"`; this is inferred from the output shape instead.
+#
+# + response - The completed Responses envelope
+# + return - The normalized finish reason
+isolated function mapResponsesFinishReason(ResponsesStreamTerminalResponse response) returns ai:FinishReason {
+    responses:OpenAIOutputItem[]? output = response.output;
+    if output is responses:OpenAIOutputItem[] {
+        foreach responses:OpenAIOutputItem item in output {
+            if item.'type == "function_call" {
+                return ai:TOOL_CALLS;
+            }
+        }
+    }
+    return ai:STOP;
+}
+
+# Validates the status carried by a terminal streaming event, mirroring `checkResponseStatus` (used for the
+# non-streaming path) but operating on the looser `ResponsesStreamTerminalResponse` shape.
+#
+# + response - The terminal response envelope
+# + return - An `ai:Error` for any non-`completed` status; `()` otherwise
+isolated function checkStreamTerminalStatus(ResponsesStreamTerminalResponse response) returns ai:Error? {
+    string? status = response.status;
+    if status == "failed" {
+        string errorMsg = "Response generation failed";
+        responses:OpenAIResponseError? responseError = response?.'error;
+        if responseError is responses:OpenAIResponseError {
+            errorMsg = responseError.message;
+        }
+        return error ai:LlmConnectionError(errorMsg);
+    }
+    if status == "incomplete" {
+        string errorMsg = "Response generation incomplete";
+        responses:OpenAIResponseIncompleteDetails? details = response?.incomplete_details;
+        if details is responses:OpenAIResponseIncompleteDetails {
+            errorMsg = string `Response incomplete: ${details.toString()}`;
+        }
+        return error ai:LlmInvalidResponseError(errorMsg);
+    }
+    if status == "cancelled" {
+        return error ai:LlmConnectionError("Response generation was cancelled");
+    }
+    return;
+}
+
+# Builds the final chunk for a `response.completed` event: an empty delta carrying only the finish reason and
+# (if present) the token usage, matching the final usage-only chunk the Chat Completions path sends.
+#
+# + response - The completed Responses envelope
+# + return - The final normalized chunk
+isolated function buildResponsesTerminalChunk(ResponsesStreamTerminalResponse response) returns ai:ChatCompletionChunk {
+    ai:ChatCompletionChunk chunk = {
+        id: response.id,
+        choices: [{index: 0, delta: {}, finishReason: mapResponsesFinishReason(response)}]
+    };
+    responses:OpenAIResponseUsage? usage = response.usage;
+    if usage is responses:OpenAIResponseUsage {
+        chunk.usage = {
+            promptTokens: usage.input_tokens,
+            completionTokens: usage.output_tokens,
+            totalTokens: usage.total_tokens
+        };
+    }
+    return chunk;
+}
+
+# Builds a single-choice chunk carrying only the given delta (no finish reason or usage), used for every
+# intermediate Responses streaming event.
+#
+# + delta - The delta to wrap
+# + return - The normalized chunk
+isolated function buildResponsesDeltaChunk(ai:ChatCompletionChunkDelta delta) returns ai:ChatCompletionChunk =>
+    {choices: [{index: 0, delta}]};
+
+# Iterator that converts the Azure OpenAI Responses API's Server-Sent Event stream into a stream of normalized
+# `ai:ChatCompletionChunk` values.
+#
+# Unlike Chat Completions (which repeats one envelope shape per chunk), the Responses API streams a sequence of
+# differently-shaped, `type`-discriminated events describing item lifecycle (`response.output_item.added`),
+# incremental text/reasoning/tool-argument fragments, and a terminal envelope (`response.completed` /
+# `.failed` / `.incomplete`). This iterator dispatches each event by its `type` and normalizes only the events
+# `chatStream`'s contract cares about; every other event type (`response.created`, `response.in_progress`,
+# `response.content_part.added`, the `.done` companion of each `.delta` event, keep-alive comments, ...) is
+# skipped. Each streamed `function_call` output item is assigned a stable `index` (keyed by its `item_id`) the
+# first time it is seen, mirroring how Chat Completions correlates streamed tool-call argument fragments.
+class ResponsesChunkIterator {
+    private stream<http:SseEvent, error?> sseStream;
+    private map<int> toolCallIndexByItemId = {};
+    private int nextToolCallIndex = 0;
+
+    isolated function init(stream<http:SseEvent, error?> sseStream) {
+        self.sseStream = sseStream;
+    }
+
+    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        while true {
+            record {|http:SseEvent value;|}|error? event = self.sseStream.next();
+            if event is () {
+                return ();
+            }
+            if event is error {
+                return error ai:Error("Error while reading the model stream", event);
+            }
+            string? data = event.value.data;
+            if data is () {
+                continue;
+            }
+            string trimmedData = data.trim();
+            if trimmedData == "" {
+                continue;
+            }
+            if trimmedData == "[DONE]" {
+                return ();
+            }
+            json|error payload = trimmedData.fromJsonString();
+            if payload is error {
+                continue;
+            }
+            ResponsesStreamEventType|error typed = payload.cloneWithType();
+            if typed is error {
+                continue;
+            }
+
+            record {|ai:ChatCompletionChunk value;|}|ai:Error? result = self.handleEvent(typed.'type, payload);
+            if result is () {
+                continue;
+            }
+            return result;
+        }
+    }
+
+    private isolated function handleEvent(string eventType, json payload)
+            returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if eventType == "response.output_item.added" {
+            ResponsesStreamOutputItemAdded|error added = payload.cloneWithType();
+            if added is error {
+                return ();
+            }
+            return self.handleOutputItemAdded(added.item);
+        }
+        if eventType == "response.output_text.delta" {
+            ResponsesStreamTextDelta|error textDelta = payload.cloneWithType();
+            if textDelta is error {
+                return ();
+            }
+            return {value: buildResponsesDeltaChunk({content: textDelta.delta})};
+        }
+        if eventType == "response.reasoning_summary_text.delta" || eventType == "response.reasoning_text.delta" {
+            ResponsesStreamReasoningDelta|error reasoningDelta = payload.cloneWithType();
+            if reasoningDelta is error {
+                return ();
+            }
+            return {value: buildResponsesDeltaChunk({reasoning: reasoningDelta.delta})};
+        }
+        if eventType == "response.function_call_arguments.delta" {
+            ResponsesStreamFunctionCallArgumentsDelta|error argsDelta = payload.cloneWithType();
+            if argsDelta is error {
+                return ();
+            }
+            int index = self.indexForItemId(argsDelta.item_id);
+            return {
+                value: buildResponsesDeltaChunk({
+                    toolCalls: [{index, 'function: {arguments: argsDelta.delta}}]
+                })
+            };
+        }
+        if eventType == "response.completed" {
+            ResponsesStreamTerminalEvent|error terminal = payload.cloneWithType();
+            if terminal is error {
+                return error ai:Error("Failed to parse the 'response.completed' event", terminal);
+            }
+            return {value: buildResponsesTerminalChunk(terminal.response)};
+        }
+        if eventType == "response.failed" || eventType == "response.incomplete" {
+            ResponsesStreamTerminalEvent|error terminal = payload.cloneWithType();
+            if terminal is error {
+                return error ai:Error(string `Response generation ${
+                    eventType == "response.failed" ? "failed" : "was incomplete"}`, terminal);
+            }
+            ai:Error? statusError = checkStreamTerminalStatus(terminal.response);
+            return statusError is ai:Error ? statusError : ();
+        }
+        if eventType == "error" {
+            ResponsesStreamErrorEvent|error errorEvent = payload.cloneWithType();
+            if errorEvent is error {
+                return error ai:Error("Error event received from the Responses API stream");
+            }
+            return error ai:LlmConnectionError(errorEvent.message);
+        }
+        return ();
+    }
+
+    private isolated function handleOutputItemAdded(ResponsesStreamItem item)
+            returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if item.'type != "function_call" {
+            return ();
+        }
+        string? itemId = item?.id;
+        if itemId is () {
+            return ();
+        }
+        int index = self.indexForItemId(itemId);
+        ai:ToolCallChunk toolCall = {index};
+        string? callId = item?.call_id;
+        if callId is string {
+            toolCall.id = callId;
+        }
+        string? name = item?.name;
+        if name is string {
+            toolCall.'function = {name};
+        }
+        return {value: buildResponsesDeltaChunk({toolCalls: [toolCall]})};
+    }
+
+    private isolated function indexForItemId(string itemId) returns int {
+        int? existing = self.toolCallIndexByItemId[itemId];
+        if existing is int {
+            return existing;
+        }
+        int index = self.nextToolCallIndex;
+        self.nextToolCallIndex += 1;
+        self.toolCallIndexByItemId[itemId] = index;
+        return index;
+    }
+
+    public isolated function close() returns ai:Error? {
+        error? result = self.sseStream.close();
+        if result is error {
+            return error ai:Error("Error while closing the model stream", result);
+        }
+        return ();
+    }
+}
+
 # Generates a structured value from the LLM via the Responses API (the `generate` method's responses path).
 #
 # + responsesClient - The generated Responses connector for the v1 GA surface (`()` on the legacy path)

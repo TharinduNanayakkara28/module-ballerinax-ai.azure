@@ -58,9 +58,13 @@ service /llm/azureopenai on mockListener {
     // A `stream: true` body (used by `chatStream`/`generateStream`) is served as a canned SSE chunk sequence
     // instead of going through the non-streaming assertions below, which do not apply to the streaming wire body.
     resource function post deployments/[string deploymentId]/chat/completions(
-            string api\-version, @http:Payload json payload) returns json|stream<http:SseEvent, error?>|error {
+            string api\-version, @http:Payload json payload)
+            returns json|stream<http:SseEvent, error?>|http:Response|error {
         map<json> payloadMap = check payload.ensureType();
         if payloadMap["stream"] == true {
+            if deploymentId == REASONING_DEPLOYMENT {
+                return buildStreamingRejectedResponse();
+            }
             return getStreamingChunkEvents().toStream();
         }
         return handleLegacyChatCompletion(deploymentId, api\-version, payload);
@@ -101,6 +105,21 @@ service /llm/azureopenai on mockListener {
     }
 }
 
+// Simulates Azure rejecting a streaming Chat Completions request for a GPT-5-series deployment (`REASONING_
+// DEPLOYMENT`), on both the legacy and v1 GA surfaces. Verifies `postChatCompletionStream` surfaces Azure's own
+// error message (rather than an opaque "failed to open the SSE stream" error) plus the Responses API hint.
+function buildStreamingRejectedResponse() returns http:Response {
+    http:Response response = new;
+    response.statusCode = http:STATUS_BAD_REQUEST;
+    response.setJsonPayload({
+        'error: {
+            message: "Streaming is not supported for this model. Use the Responses API instead.",
+            'type: "invalid_request_error"
+        }
+    });
+    return response;
+}
+
 // Shared legacy Chat Completions handler. Both legacy chat routes (with and without an `/openai` base-path
 // segment) delegate here, so the wire assertions apply to every legacy base URL shape.
 function handleLegacyChatCompletion(string deploymentId, string apiVersion, json payload)
@@ -133,9 +152,12 @@ service /llm/azureopenai/openai/v1 on mockListener {
     // never reach this route. A `stream: true` body (used by `chatStream`/`generateStream`) is served as a canned
     // SSE chunk sequence instead of going through the non-streaming assertions below.
     resource function post chat/completions(@http:Payload json payload, string? api\-version = ())
-            returns json|stream<http:SseEvent, error?>|error {
+            returns json|stream<http:SseEvent, error?>|http:Response|error {
         map<json> payloadMap = check payload.ensureType();
         if payloadMap["stream"] == true {
+            if payloadMap["model"] == REASONING_DEPLOYMENT {
+                return buildStreamingRejectedResponse();
+            }
             return getStreamingChunkEvents().toStream();
         }
         string model = check payload.model.ensureType();

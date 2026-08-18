@@ -122,15 +122,29 @@ function testGenerateStreamWithUnsupportedType() returns error? {
             string `unexpected error message: ${message}`);
 }
 
+// GPT-5-series deployments (`REASONING_DEPLOYMENT`, see `test_services.bal`) can reject a streaming Chat
+// Completions request. `chatStream`/`generateStream` must surface Azure's own error message plus a hint pointing
+// at `apiType = RESPONSES`, rather than an opaque "failed to open the SSE stream" error.
+
 @test:Config
-function testChatStreamUnsupportedForResponsesApi() returns error? {
-    OpenAiModelProvider responsesProvider =
-        check new (SERVICE_URL, API_KEY, "gpt4streaming", API_VERSION, apiType = RESPONSES);
+function testChatStreamRejectedForGpt5SeriesLegacy() returns error? {
+    check assertChatStreamRejectedForGpt5Series(
+        check new (SERVICE_URL, API_KEY, REASONING_DEPLOYMENT, API_VERSION));
+}
+
+@test:Config
+function testChatStreamRejectedForGpt5SeriesV1() returns error? {
+    check assertChatStreamRejectedForGpt5Series(check new (SERVICE_URL_V1, API_KEY, REASONING_DEPLOYMENT));
+}
+
+function assertChatStreamRejectedForGpt5Series(OpenAiModelProvider provider) returns error? {
     stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result =
-        responsesProvider->chatStream({role: ai:USER, content: "Say hello."});
-    test:assertTrue(result is ai:Error, "Expected an error when streaming a Responses API provider");
+        provider->chatStream({role: ai:USER, content: "Say hello."});
+    test:assertTrue(result is ai:Error, "Expected an error when streaming a rejected GPT-5-series deployment");
 
     string message = (<ai:Error>result).message();
-    test:assertTrue(message.includes("apiType = CHAT_COMPLETIONS"),
-            string `unexpected error message: ${message}`);
+    test:assertTrue(message.includes("Streaming is not supported for this model"),
+            string `Azure's own error message was not surfaced: ${message}`);
+    test:assertTrue(message.includes("apiType = RESPONSES"),
+            string `expected a hint pointing at the Responses API: ${message}`);
 }
