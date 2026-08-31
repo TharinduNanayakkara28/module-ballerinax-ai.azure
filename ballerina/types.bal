@@ -127,9 +127,15 @@ public enum ReasoningEffort {
 // Azure-specific `reasoning_content` extension. It is not reused directly for parsing here because it declares
 // `content`/`refusal`/`reasoning_content`/`usage` as optional but not nilable, whereas Azure sends each of these
 // as an explicit JSON `null` on chunks that don't carry that field; binding the raw SSE payload straight to the
-// generated type therefore fails `cloneWithType` on those chunks. These module-local mirrors keep the same field
-// set (reusing the connector's tool-call-chunk and usage types, which are not affected) but declare every
-// Azure-nullable field nilable.
+// generated type therefore fails `cloneWithType` on those chunks.
+//
+// These module-local mirrors keep the same field set but declare EVERY field Azure may send as `null` nilable,
+// including inside the tool-call chunks - Azure omits `id`/`type` on the tool-call fragments that follow the
+// first one on some api-versions and sends them as explicit `null` on others, and the connector's
+// `OpenAIChatCompletionMessageToolCallChunk` types both as non-nilable. Since a bind failure now fails the whole
+// stream (see `AzureOpenAiChunkIterator`), tolerating those nulls here is what keeps a well-formed response from
+// being reported as a wire error. Fields this module does not surface (`system_fingerprint`, `object`,
+// `created`, `logprobs`, ...) are simply not modeled: every record here is open, so they bind and are ignored.
 
 # Wire shape of a Chat Completions streaming chunk (`chat.completion.chunk`), as sent by Azure over SSE.
 type ChatCompletionChunk record {
@@ -137,8 +143,6 @@ type ChatCompletionChunk record {
     string id?;
     # The model that produced the completion
     string model?;
-    # Backend configuration fingerprint associated with this completion
-    string system_fingerprint?;
     # Choices in this chunk; empty in the final usage-only chunk
     ChatCompletionChunkChoice[] choices;
     # Token usage, present only in the final chunk when `stream_options.include_usage` is set. Azure sends this
@@ -157,21 +161,44 @@ type ChatCompletionChunkChoice record {
     string? finish_reason?;
 };
 
-# The incremental delta for a streamed choice. Azure sends `content`/`refusal`/`reasoning_content` as explicit
-# JSON `null` on chunks that don't carry that field (e.g. a tool-call-only delta), so these must be nilable, not
-# just optional, or `cloneWithType` rejects the chunk.
+# The incremental delta for a streamed choice. Azure sends `role`/`content`/`refusal`/`reasoning_content` as
+# explicit JSON `null` on chunks that don't carry that field (e.g. a tool-call-only delta), so these must be
+# nilable, not just optional, or `cloneWithType` rejects the chunk.
 type ChatCompletionChunkDelta record {
     # Role of the author, sent only on the first delta (typically "assistant")
-    string role?;
+    string? role?;
     # Text content chunk
     string? content?;
     # Refusal message chunk, if the model refuses
     string? refusal?;
     # Incremental tool calls being streamed
-    chat:OpenAIChatCompletionMessageToolCallChunk[] tool_calls?;
+    ChatCompletionMessageToolCallChunk[]? tool_calls?;
     # Azure-specific extension carrying the reasoning/chain-of-thought fragment streamed by supported reasoning
     # ("thinking") models, e.g. `o3`, `o4-mini`
     string? reasoning_content?;
+};
+
+# An incremental tool call within a streamed delta. Mirrors the connector's
+# `OpenAIChatCompletionMessageToolCallChunk` with `id`/`type` nilable: Azure sends both only on the first
+# fragment of a call and may send them as explicit `null` on the fragments that follow.
+type ChatCompletionMessageToolCallChunk record {
+    # Index used to accumulate fragments of the same tool call across chunks
+    int index;
+    # The ID of the tool call; only on the first fragment of the call
+    string? id?;
+    # The type of the tool; only `function` is supported
+    string? 'type?;
+    # The function name/arguments fragment
+    ChatCompletionMessageToolCallChunkFunction? 'function?;
+};
+
+# The function fragment of a streamed tool call, with both fields nilable for the same reason as
+# `ChatCompletionMessageToolCallChunk`.
+type ChatCompletionMessageToolCallChunkFunction record {
+    # Name of the function to call; only on the first fragment of the call
+    string? name?;
+    # Incremental JSON-string fragment of the function arguments
+    string? arguments?;
 };
 
 # Converts one parsed Azure wire chunk into the normalized chunk that `chatStream` returns.
@@ -194,17 +221,17 @@ isolated function toAiChunk(ChatCompletionChunk w) returns ai:ChatCompletionChun
         if reasoning is string {
             delta.reasoning = reasoning;
         }
-        chat:OpenAIChatCompletionMessageToolCallChunk[]? wireToolCalls = c.delta?.tool_calls;
-        if wireToolCalls is chat:OpenAIChatCompletionMessageToolCallChunk[] {
+        ChatCompletionMessageToolCallChunk[]? wireToolCalls = c.delta?.tool_calls;
+        if wireToolCalls is ChatCompletionMessageToolCallChunk[] {
             ai:ToolCallChunk[] toolCalls = [];
-            foreach chat:OpenAIChatCompletionMessageToolCallChunk tc in wireToolCalls {
+            foreach ChatCompletionMessageToolCallChunk tc in wireToolCalls {
                 ai:ToolCallChunk toolCall = {index: tc.index};
                 string? id = tc?.id;
                 if id is string {
                     toolCall.id = id;
                 }
-                chat:OpenAIChatCompletionMessageToolCallChunkFunction? fn = tc?.'function;
-                if fn is chat:OpenAIChatCompletionMessageToolCallChunkFunction {
+                ChatCompletionMessageToolCallChunkFunction? fn = tc?.'function;
+                if fn is ChatCompletionMessageToolCallChunkFunction {
                     ai:FunctionCallChunk functionCallChunk = {};
                     string? name = fn?.name;
                     if name is string {

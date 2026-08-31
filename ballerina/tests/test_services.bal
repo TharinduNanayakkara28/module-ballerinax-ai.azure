@@ -39,6 +39,10 @@ const REASONING_DEPLOYMENT = "gpt-5";
 const CUSTOM_TOKENS_DEPLOYMENT = "custom-tokens-model";
 const int CUSTOM_MAX_TOKENS = 1234;
 
+// Deployment ids that select a Chat Completions streaming scenario in the mock (see `selectChatStreamEvents`).
+const MALFORMED_STREAM_DEPLOYMENT = "streaming-malformed";
+const TOOL_STREAM_DEPLOYMENT = "streaming-tools";
+
 // The reasoning-effort values accepted by the Azure OpenAI specification.
 final readonly & string[] VALID_REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
@@ -65,7 +69,8 @@ service /llm/azureopenai on mockListener {
             if deploymentId == REASONING_DEPLOYMENT {
                 return buildStreamingRejectedResponse();
             }
-            return getStreamingChunkEvents().toStream();
+            assertChatStreamRequest(payloadMap, false, api\-version);
+            return selectChatStreamEvents(deploymentId).toStream();
         }
         return handleLegacyChatCompletion(deploymentId, api\-version, payload);
     }
@@ -77,15 +82,25 @@ service /llm/azureopenai on mockListener {
         return handleLegacyChatCompletion(deploymentId, api\-version, payload);
     }
 
-    // Responses — legacy preview route. The `api-version` query parameter is REQUIRED here.
+    // Responses — legacy preview route. The `api-version` query parameter is REQUIRED here. A `stream: true`
+    // body (used by `chatStream` with `apiType = RESPONSES`) is served as a canned event sequence selected by
+    // the deployment, instead of going through the non-streaming assertions.
     resource function post responses(string api\-version, @http:Payload json payload)
-            returns json|error {
+            returns json|stream<http:SseEvent, error?>|http:Response|error {
+        map<json> payloadMap = check payload.ensureType();
+        if payloadMap["stream"] == true {
+            return handleResponsesStream(payloadMap);
+        }
         return handleLegacyResponses(api\-version, payload);
     }
 
     // Responses — same route under an `/openai` base path.
     resource function post openai/responses(string api\-version, @http:Payload json payload)
-            returns json|error {
+            returns json|stream<http:SseEvent, error?>|http:Response|error {
+        map<json> payloadMap = check payload.ensureType();
+        if payloadMap["stream"] == true {
+            return handleResponsesStream(payloadMap);
+        }
         return handleLegacyResponses(api\-version, payload);
     }
 
@@ -103,6 +118,78 @@ service /llm/azureopenai on mockListener {
         return buildEmbeddingsResponse(input is embeddings:InputItemsString[],
                 input is string && input == EMPTY_EMBED_TRIGGER);
     }
+}
+
+// ===== Streaming mock helpers =====
+
+// Wire assertions for a streaming Chat Completions request. The streaming branches short-circuit before the
+// non-streaming assertions, so without these nothing would check that a streamed request carries the same
+// correctly-built body as a non-streamed one.
+//
+// `stream_options` is the one field that legitimately differs by surface: Azure only accepted it from
+// api-version 2024-08-01-preview onward, so on older legacy api-versions it must be absent or the whole request
+// is rejected with "Unrecognized request argument supplied: stream_options".
+function assertChatStreamRequest(map<json> payload, boolean isV1, string? apiVersion) {
+    test:assertEquals(payload["stream"], true, "Streaming: 'stream' must be true on the wire");
+    if isV1 {
+        test:assertTrue(payload["model"] is string,
+                "Chat Completions stream (v1): the deployment must be sent as 'model' in the body");
+        test:assertTrue(payload.hasKey("max_completion_tokens"),
+                "Chat Completions stream (v1): 'max_completion_tokens' expected");
+        test:assertFalse(payload.hasKey("max_tokens"),
+                "Chat Completions stream (v1): deprecated 'max_tokens' must not be present");
+        test:assertTrue(payload.hasKey("stream_options"),
+                "Chat Completions stream (v1): 'stream_options' is always supported on the v1 GA surface");
+        return;
+    }
+    test:assertFalse(payload.hasKey("model"),
+            "Chat Completions stream (legacy): 'model' must not be present (deployment is in the URL)");
+    string version = apiVersion ?: "";
+    boolean expectStreamOptions = version >= "2024-08-01";
+    test:assertEquals(payload.hasKey("stream_options"), expectStreamOptions,
+            string `Chat Completions stream (legacy): 'stream_options' support for api-version '${version}'`);
+    test:assertEquals(payload.hasKey("max_completion_tokens"), version >= "2024-09-01",
+            string `Chat Completions stream (legacy): token-limit field for api-version '${version}'`);
+}
+
+// Selects the canned Chat Completions event sequence for a deployment, so one test per scenario drives the real
+// iterator end to end.
+function selectChatStreamEvents(string deploymentId) returns http:SseEvent[] {
+    if deploymentId == MALFORMED_STREAM_DEPLOYMENT {
+        return getMalformedStreamingChunkEvents();
+    }
+    if deploymentId == TOOL_STREAM_DEPLOYMENT {
+        return getStreamingToolCallEvents();
+    }
+    return getStreamingChunkEvents();
+}
+
+// Serves the Responses API streaming scenarios, selected by deployment. Shared by the legacy and v1 GA routes so
+// both surfaces are exercised against identical event sequences.
+function handleResponsesStream(map<json> payload) returns stream<http:SseEvent, error?>|http:Response {
+    test:assertEquals(payload["stream"], true, "Responses stream: 'stream' must be true on the wire");
+    json model = payload["model"];
+    test:assertTrue(model is string, "Responses stream: the deployment must be sent as 'model' in the body");
+    // The Responses API emits reasoning fragments only when a summary is requested alongside the effort, so a
+    // provider that sets `reasoning.effort` without `reasoning.summary` would silently never stream reasoning.
+    json reasoning = payload["reasoning"];
+    if reasoning is map<json> && reasoning.hasKey("effort") {
+        test:assertTrue(reasoning.hasKey("summary"),
+                "Responses stream: 'reasoning.summary' must accompany 'reasoning.effort' to get reasoning deltas");
+    }
+    if model == RESPONSES_STREAM_TOOLS_DEPLOYMENT {
+        return getResponsesStreamToolCallEvents().toStream();
+    }
+    if model == RESPONSES_STREAM_FAILED_DEPLOYMENT {
+        return getResponsesStreamFailedEvents().toStream();
+    }
+    if model == RESPONSES_STREAM_INCOMPLETE_DEPLOYMENT {
+        return getResponsesStreamIncompleteEvents().toStream();
+    }
+    if model == RESPONSES_STREAM_ERROR_DEPLOYMENT {
+        return getResponsesStreamErrorEvents().toStream();
+    }
+    return getResponsesStreamEvents().toStream();
 }
 
 // Simulates Azure rejecting a streaming Chat Completions request for a GPT-5-series deployment (`REASONING_
@@ -155,10 +242,13 @@ service /llm/azureopenai/openai/v1 on mockListener {
             returns json|stream<http:SseEvent, error?>|http:Response|error {
         map<json> payloadMap = check payload.ensureType();
         if payloadMap["stream"] == true {
-            if payloadMap["model"] == REASONING_DEPLOYMENT {
+            json model = payloadMap["model"];
+            if model == REASONING_DEPLOYMENT {
                 return buildStreamingRejectedResponse();
             }
-            return getStreamingChunkEvents().toStream();
+            assertV1ApiVersion(api\-version);
+            assertChatStreamRequest(payloadMap, true, ());
+            return selectChatStreamEvents(model is string ? model : "").toStream();
         }
         string model = check payload.model.ensureType();
         assertV1ApiVersion(api\-version);
@@ -171,8 +261,13 @@ service /llm/azureopenai/openai/v1 on mockListener {
     }
 
     // Responses — v1 GA route. An `api-version` query parameter is only present on a `preview`/`v1` opt-in.
-    resource function post responses(@http:Payload json payload, string? api\-version = ()) returns json|error {
+    resource function post responses(@http:Payload json payload, string? api\-version = ())
+            returns json|stream<http:SseEvent, error?>|http:Response|error {
         assertV1ApiVersion(api\-version);
+        map<json> payloadMap = check payload.ensureType();
+        if payloadMap["stream"] == true {
+            return handleResponsesStream(payloadMap);
+        }
         validateResponsesWireParams(payload);
         return handleResponsesApiRequest(payload);
     }

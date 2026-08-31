@@ -206,12 +206,46 @@ public isolated client class OpenAiModelProvider {
         return self.chatStreamViaResponses(messages, tools, stop);
     }
 
+    # Creates and populates the chat span for a streaming request, mirroring what `chat` records for a
+    # non-streaming one. The span is handed to the chunk iterator, which owns closing it: a stream's work is not
+    # finished when `chatStream` returns, only when the last chunk has been read or the stream has failed.
+    #
+    # + messages - The messages being sent, recorded as the span input
+    # + tools - The tool definitions being sent, if any
+    # + stop - The stop sequence, if any
+    # + return - The open span
+    private isolated function openChatStreamSpan(ai:ChatMessage[]|ai:ChatUserMessage messages,
+            ai:ChatCompletionFunctions[] tools, string? stop) returns observe:ChatSpan {
+        observe:ChatSpan span = observe:createChatSpan(self.deploymentId);
+        span.addProvider("azure.ai.openai");
+        span.addOutputType(observe:TEXT);
+        if stop is string {
+            span.addStopSequence(stop);
+        }
+        decimal? temp = self.temperature;
+        if temp is decimal {
+            span.addTemperature(temp);
+        }
+        // Best-effort span input logging; multimodal content that cannot be stringified is simply not logged.
+        json|ai:Error jsonMsg = convertMessageToJson(messages);
+        if jsonMsg is json {
+            span.addInputMessages(jsonMsg);
+        }
+        if tools.length() > 0 {
+            span.addTools(tools);
+        }
+        return span;
+    }
+
     private isolated function chatStreamViaChatCompletions(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools, string? stop) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        observe:ChatSpan span = self.openChatStreamSpan(messages, tools, stop);
         chat:OpenAIChatCompletionRequestMessage[]|ai:Error completionMessages =
             self.prepareCompletionRequestMessages(messages);
         if completionMessages is ai:Error {
-            return error ai:Error("Error while preparing completion request messages", completionMessages);
+            ai:Error err = error ai:Error("Error while preparing completion request messages", completionMessages);
+            span.close(err);
+            return err;
         }
         chat:ChatCompletionsBody request = {
             model: self.deploymentId,
@@ -240,17 +274,21 @@ public isolated client class OpenAiModelProvider {
                 self.legacyChatClient, self.useV1, self.apiKey, self.deploymentId, self.apiVersion,
                 self.v1ApiVersion, request);
         if sseStream is ai:Error {
+            span.close(sseStream);
             return sseStream;
         }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AzureOpenAiChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new AzureOpenAiChunkIterator(sseStream, span));
         return chunkStream;
     }
 
     private isolated function chatStreamViaResponses(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools, string? stop) returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+        observe:ChatSpan span = self.openChatStreamSpan(messages, tools, stop);
         [responses:OpenAIInputItem[], string?]|ai:Error responseInput = convertToResponsesInput(messages);
         if responseInput is ai:Error {
-            return error ai:Error("Error while transforming input for Responses API", responseInput);
+            ai:Error err = error ai:Error("Error while transforming input for Responses API", responseInput);
+            span.close(err);
+            return err;
         }
         [responses:OpenAIInputItem[], string?] [inputItems, instructions] = responseInput;
 
@@ -276,15 +314,20 @@ public isolated client class OpenAiModelProvider {
         }
         ReasoningEffort? reasoningEffort = self.reasoning;
         if reasoningEffort is ReasoningEffort {
-            request.reasoning = {effort: reasoningEffort};
+            // `summary` is what makes the Responses API emit `response.reasoning_summary_text.delta` events at
+            // all; without it the stream carries no reasoning fragments and `delta.reasoning` stays empty, while
+            // the Chat Completions path streams them via `reasoning_content`. `auto` lets the deployment pick
+            // the summary detail it supports rather than forcing one it may reject.
+            request.reasoning = {effort: reasoningEffort, summary: "auto"};
         }
 
         stream<http:SseEvent, error?>|ai:Error sseStream = postResponsesStream(self.v1ResponsesStreamClient,
                 self.legacyResponsesClient, self.useV1, self.apiKey, self.apiVersion, self.v1ApiVersion, request);
         if sseStream is ai:Error {
+            span.close(sseStream);
             return sseStream;
         }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new ResponsesChunkIterator(sseStream));
+        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new ResponsesChunkIterator(sseStream, span));
         return chunkStream;
     }
 
@@ -840,22 +883,43 @@ class ChunkTextIterator {
 
 # Iterator that converts Azure OpenAI's Server-Sent Event stream into a stream of normalized
 # `ai:ChatCompletionChunk` values. Each `data:` line is parsed into the Azure wire chunk and mapped via
-# `toAiChunk`; the terminating `[DONE]` sentinel, blank lines, and unparseable keep-alive comments are skipped.
+# `toAiChunk`; SSE comments (which carry no `data` field) and blank payloads are skipped, and the terminating
+# `[DONE]` sentinel ends the stream.
+#
+# A payload that is not valid JSON, or that does not bind to the Azure wire chunk shape, is surfaced as an
+# `ai:LlmInvalidResponseError` rather than skipped: the module-local wire types exist precisely because Azure's
+# payloads do not bind to the generated connector types, so a bind failure is the expected symptom of a wire-shape
+# drift. Skipping it would silently drop answer text or make a whole tool call vanish with no error.
 class AzureOpenAiChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
+    # The chat span opened by `chatStream`. The iterator owns it: a streaming request is not finished when
+    # `chatStream` returns, only when the last chunk has been read, so the span is closed here.
+    private observe:ChatSpan span;
+    # `true` once the stream has terminated (via `[DONE]`, exhaustion, an error, or an explicit `close`), so a
+    # later `next` returns `()` instead of resuming reads against a finished stream.
+    private boolean done = false;
+    # `true` once the response id has been recorded on the span; it repeats on every chunk.
+    private boolean responseIdRecorded = false;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
+        self.span = span;
     }
 
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+        if self.done {
+            return ();
+        }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
+                self.finish();
                 return ();
             }
             if event is error {
-                return error ai:Error("Error while reading the model stream", event);
+                ai:Error err = error ai:Error("Error while reading the model stream", event);
+                self.finish(err);
+                return err;
             }
             string? data = event.value.data;
             if data is () {
@@ -866,25 +930,94 @@ class AzureOpenAiChunkIterator {
                 continue;
             }
             if trimmedData == "[DONE]" {
+                self.finish();
                 return ();
             }
             json|error payload = trimmedData.fromJsonString();
             if payload is error {
-                continue;
+                ai:Error err = error ai:LlmInvalidResponseError(
+                        "Invalid or malformed chunk received from the model stream", payload);
+                self.finish(err);
+                return err;
             }
             ChatCompletionChunk|error wireChunk = payload.cloneWithType();
             if wireChunk is error {
-                continue;
+                ai:Error err = error ai:LlmInvalidResponseError(
+                        "Unexpected chunk shape received from the model stream", wireChunk);
+                self.finish(err);
+                return err;
             }
-            return {value: toAiChunk(wireChunk)};
+            ai:ChatCompletionChunk chunk = toAiChunk(wireChunk);
+            recordChunkOnSpan(self.span, chunk, self.responseIdRecorded);
+            if chunk.id is string {
+                self.responseIdRecorded = true;
+            }
+            return {value: chunk};
         }
     }
 
-    public isolated function close() returns ai:Error? {
+    # Marks the stream finished, releases the underlying SSE connection, and closes the span. Termination via
+    # `[DONE]` happens before the transport stream is exhausted, so without the close the connection is left
+    # half-read and never returned to the pool. A close failure here is not surfaced to the caller: the chunks
+    # were already delivered successfully, and failing the stream at that point would be misleading.
+    #
+    # + err - The error that terminated the stream, if any
+    private isolated function finish(ai:Error? err = ()) {
+        if self.done {
+            return;
+        }
+        self.done = true;
         error? result = self.sseStream.close();
+        if result is error {
+            log:printDebug("Failed to close the Azure OpenAI SSE stream", result);
+        }
+        self.span.close(err);
+    }
+
+    public isolated function close() returns ai:Error? {
+        if self.done {
+            return ();
+        }
+        self.done = true;
+        error? result = self.sseStream.close();
+        self.span.close(result is error ? result : ());
         if result is error {
             return error ai:Error("Error while closing the model stream", result);
         }
         return ();
+    }
+}
+
+# Records what a streamed chunk contributes to the chat span: the response id (once), the finish reason, and the
+# token counts carried by the final usage chunk. Shared by both streaming surfaces so a `chatStream` trace
+# carries the same attributes as the equivalent non-streaming `chat` trace.
+#
+# + span - The span to record onto
+# + chunk - The chunk being yielded to the caller
+# + responseIdRecorded - `true` when a previous chunk already supplied the response id
+isolated function recordChunkOnSpan(observe:ChatSpan span, ai:ChatCompletionChunk chunk,
+        boolean responseIdRecorded) {
+    string? id = chunk.id;
+    if !responseIdRecorded && id is string {
+        span.addResponseId(id);
+    }
+    ai:CompletionTokenUsage? usage = chunk.usage;
+    if usage is ai:CompletionTokenUsage {
+        int? promptTokens = usage.promptTokens;
+        if promptTokens is int {
+            span.addInputTokenCount(promptTokens);
+        }
+        int? completionTokens = usage.completionTokens;
+        if completionTokens is int {
+            span.addOutputTokenCount(completionTokens);
+        }
+    }
+    ai:ChatCompletionChunkChoice[] choices = chunk.choices;
+    if choices.length() == 0 {
+        return;
+    }
+    ai:FinishReason? finishReason = choices[0].finishReason;
+    if finishReason is ai:FinishReason {
+        span.addFinishReason(finishReason);
     }
 }
